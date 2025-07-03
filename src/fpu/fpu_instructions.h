@@ -18,6 +18,21 @@
 
 #include <math.h> /* for isinf, etc */
 #include "cpu/lazyflags.h"
+
+static inline uint64_t mem_readq(PhysPt addr) {
+    uint64_t tmp;
+
+    tmp  = (uint64_t)mem_readd(addr);
+    tmp |= (uint64_t)mem_readd(addr+4ul) << (uint64_t)32ul;
+
+    return tmp;
+}
+
+static inline void mem_writeq(PhysPt addr,uint64_t v) {
+    mem_writed(addr,    (uint32_t)v);
+    mem_writed(addr+4ul,(uint32_t)(v >> (uint64_t)32ul));
+}
+
 static void FPU_FINIT(void) {
 	unsigned int i;
 
@@ -193,16 +208,10 @@ static void FPU_FLD_I32(PhysPt addr,Bitu store_to) {
 }
 
 static void FPU_FLD_I64(PhysPt addr,Bitu store_to) {
-	FPU_Reg blah;
-	blah.l.lower = mem_readd(addr);
-	blah.l.upper = (int32_t)mem_readd(addr+4);
-	fpu.regs[store_to].d = static_cast<double>(blah.ll);
-	// store the signed 64-bit integer in the 80-bit format mantissa with faked exponent.
-	// this is needed for DOS and Windows games that use the Pentium fast memcpy trick, using FLD/FST to copy 64 bits at a time.
-	// I wonder if that trick is what helped spur Intel to make the MMX extensions :)
-	fpu.regs_80[store_to].raw.l = (uint64_t)blah.ll;
-	fpu.regs_80[store_to].raw.h = ((blah.ll/*sign bit*/ >> (uint64_t)63) ? 0x8000u : 0x0000u) + FPU_Reg_80_exponent_bias + 63u; // FIXME: Verify this is correct!
-	fpu.use80[store_to] = true;
+	const int64_t val = mem_readq(addr);
+	fpu.regs[store_to].d = static_cast<double>(val);
+	fpu.regs_memcpy[store_to].ll = val;
+	fpu.use80[store_to] = false;
 }
 
 static void FPU_FBLD(PhysPt addr,Bitu store_to) {
@@ -272,21 +281,20 @@ static void FPU_FST_I32(PhysPt addr) {
 }
 
 static void FPU_FST_I64(PhysPt addr) {
-	FPU_Reg blah;
-	if (fpu.use80[TOP] && (fpu.regs_80[TOP].raw.h & 0x7FFFu) == (0x0000u + FPU_Reg_80_exponent_bias + 63u)) {
-		// FIXME: This works so far for DOS demos that use the "Pentium memcpy trick" to copy 64 bits at a time.
-		//        What this code needs to do is take the exponent into account and then clamp the 64-bit int within range.
-		//        This cheap hack is good enough for now.
-		mem_writed(addr,(uint32_t)(fpu.regs_80[TOP].raw.l));
-		mem_writed(addr+4,(uint32_t)(fpu.regs_80[TOP].raw.l >> (uint64_t)32));
-	}
-	else {
-		double val = FROUND(fpu.regs[TOP].d);
-		blah.ll = (val < 9223372036854775808.0 && val >= -9223372036854775808.0)?static_cast<int64_t>(val):LONGTYPE(0x8000000000000000);
+	constexpr double MaxInt64Value = 9223372036854775808.0;
 
-		mem_writed(addr,(uint32_t)blah.l.lower);
-		mem_writed(addr+4,(uint32_t)blah.l.upper);
+	// Handle the 64-bit memcpy trick.
+	auto val_i       = fpu.regs_memcpy[TOP].ll;
+	const auto val_d = fpu.regs[TOP].d;
+
+	if (val_d != static_cast<double>(val_i)) {
+		const auto rounded = FROUND(val_d);
+		val_i = (rounded < MaxInt64Value && rounded >= -MaxInt64Value)
+		              ? static_cast<int64_t>(rounded)
+		              : LONGTYPE(0x8000000000000000);
 	}
+
+	mem_writeq(addr, val_i);
 }
 
 // WARNING: UNTESTED. Original contributed code only focused on the x86 FPU case.
@@ -457,27 +465,21 @@ static void FPU_FSUBR(Bitu st, Bitu other){
 }
 
 static void FPU_FXCH(Bitu st, Bitu other){
-	FPU_Reg_80 reg80 = fpu.regs_80[other];
-	FPU_Tag tag = fpu.tags[other];
-	FPU_Reg reg = fpu.regs[other];
-	bool use80 = fpu.use80[other];
-
-	fpu.regs_80[other] = fpu.regs_80[st];
-	fpu.use80[other] = fpu.use80[st];
-	fpu.tags[other] = fpu.tags[st];
-	fpu.regs[other] = fpu.regs[st];
-
-	fpu.regs_80[st] = reg80;
-	fpu.use80[st] = use80;
-	fpu.tags[st] = tag;
-	fpu.regs[st] = reg;
+	const auto tag             = fpu.tags[other];
+	const auto reg             = fpu.regs[other];
+	const auto reg_memcpy      = fpu.regs_memcpy[other];
+	fpu.tags[other]            = fpu.tags[st];
+	fpu.regs[other]            = fpu.regs[st];
+	fpu.regs_memcpy[other]     = fpu.regs_memcpy[st];
+	fpu.tags[st]               = tag;
+	fpu.regs[st]               = reg;
+	fpu.regs_memcpy[st]        = reg_memcpy;
 }
 
 static void FPU_FST(Bitu st, Bitu other){
-	fpu.regs_80[other] = fpu.regs_80[st];
-	fpu.use80[other] = fpu.use80[st];
-	fpu.tags[other] = fpu.tags[st];
-	fpu.regs[other] = fpu.regs[st];
+	fpu.tags[other]            = fpu.tags[st];
+	fpu.regs[other]            = fpu.regs[st];
+	fpu.regs_memcpy[other]     = fpu.regs_memcpy[st];
 }
 
 static inline void FPU_FCMOV(Bitu st, Bitu other){

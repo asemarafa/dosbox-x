@@ -454,6 +454,7 @@ typedef struct {
 #else
 	bool		use80[9];		// if set, use the 80-bit precision version
 #endif
+	FPU_Reg		regs_memcpy[9];
 	FPU_Tag		tags[9];
 	FPUControlWord  cw;
 	FPUStatusWord   sw;
